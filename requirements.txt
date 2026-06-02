@@ -1,0 +1,7 @@
+edgartools
+yfinance
+pandas
+python-dotenv
+requests
+tqdm
+ipywidgets

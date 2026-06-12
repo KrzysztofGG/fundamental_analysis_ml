@@ -271,7 +271,7 @@ def run_backtest(
                 n_skipped += 1
                 continue
             if not p_out:
-                tqdm.write(f"    skip {ticker}: no exit price on {exit_dt.date()}")
+                # tqdm.write(f"    skip {ticker}: no exit price on {exit_dt.date()}")
                 n_skipped += 1
                 continue
             if p_in <= 0:
@@ -388,7 +388,9 @@ def run_backtest(
     print(f"    Max drawdown        : {max_drawdown(results['cum_combined']):.2%}")
     print(f"\n  SPY benchmark (per-position avg window)")
     print(f"    Mean qtrly return   : {results['spy_ret'].mean():+.2%}")
+    print(f"    Annualised Sharpe   : {sharpe_ann(results['spy_ret']):.3f}")
     print(f"    Total return        : {results['cum_spy'].iloc[-1]:+.2%}")
+    print(f"    Max drawdown        : {max_drawdown(results['cum_spy']):.2%}")
     print(f"\n  Mean position-level alpha : {results['alpha'].mean():+.2%}")
     if rebalance_mode == "staggered":
         print(f"  Mean hold period (days)   : {trades['hold_days'].mean():.0f}")

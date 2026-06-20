@@ -1,0 +1,15 @@
+cache/
+data_quarterly/
+data_quarterly_parquet/
+data_yearly/
+data_yearly_parquet/
+price_cache/
+raw_data/
+venv/
+.env
+checkpoint.json
+company_tickers.json
+data_quarterly_parquet.7z
+raw_data.7z
+optuna_studies.*
+*.ubj

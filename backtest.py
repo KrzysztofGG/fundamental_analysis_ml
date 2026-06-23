@@ -5,7 +5,7 @@ backtest.py — Quarterly portfolio backtest using a trained XGBoost ranking mod
 Rebalance modes
 ---------------
 fixed      Each calendar quarter, all stocks whose filing_date_used fell in that
-           quarter are scored at the same time.  The entire cohort is entered at
+           quarter are scored at the same time.  The entire batch is entered at
            the quarter-end close and exited at the following quarter-end close.
            Clean portfolio math; one unambiguous return per quarter.
 
@@ -29,6 +29,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from datetime import datetime
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -43,7 +44,8 @@ from tqdm import tqdm
 # ── Paths ──────────────────────────────────────────────────────────────────────
 RESULTS_DIR = Path("results")
 PRICE_CACHE = Path("price_cache")
-DATA_DIR    = Path("data_quarterly_parquet")
+DATA_DIR    = Path("data_quarterly_to_present_parquet")
+# DATA_DIR    = Path("data_quarterly_parquet")
 PRICE_CACHE.mkdir(exist_ok=True)
 
 METADATA_COLS = {"ticker", "sector", "industry", "fiscalDateEnding",
@@ -144,21 +146,20 @@ def fit_cleanup(df_ref: pd.DataFrame, feat_cols: list[str]):
     lower   = X.quantile(0.01)
     upper   = X.quantile(0.99)
     medians = X.median()
-    sel     = VarianceThreshold(threshold=1e-5)
-    sel.fit(X.fillna(medians))
-    kept = X.columns[sel.get_support()].tolist()
-    return lower, upper, medians, kept
+    # sel     = VarianceThreshold(threshold=1e-5)
+    # sel.fit(X.fillna(medians))
+    # kept = X.columns[sel.get_support()].tolist()
+    return lower, upper, medians
 
 
 def apply_cleanup(X: pd.DataFrame,
                   lower: pd.Series, upper: pd.Series,
-                  medians: pd.Series, kept: list[str],
-                  feats: list[str]) -> pd.DataFrame:
+                  medians: pd.Series
+                  ) -> pd.DataFrame:
     X = X.replace([np.inf, -np.inf], np.nan)
     X = X.clip(lower=lower, upper=upper, axis=1)
     X = X.fillna(medians)
-    cols = [c for c in feats if c in kept]
-    return X.reindex(columns=cols, fill_value=0.0)
+    return X
 
 
 # ── Test-window inference ─────────────────────────────────────────────────────
@@ -170,10 +171,17 @@ def infer_test_window(df: pd.DataFrame,
 
     Returns (start_date, end_date) as 'YYYY-MM-DD' strings ready for run_backtest.
     """
-    max_date   = df["filing_date_used"].max()
-    # max_date   = df["fiscalDateEnding"].max()
-    start_date = max_date - pd.DateOffset(months=test_months)
-    return start_date.strftime("%Y-%m-%d"), max_date.strftime("%Y-%m-%d")
+    # start_date = max_date - pd.DateOffset(months=test_months)
+    end_date   = df["filing_date_used"].max() - pd.DateOffset(month=3)
+    # end_date = datetime.strptime("2025-12-31", "%Y-%m-%d").date()
+
+    start_date = datetime.strptime("2023-03-31", "%Y-%m-%d").date()
+    # print("[WARN] Using hardcoded backtest start date")
+
+    return (
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d")
+    )
 
 
 # ── Next-filing map (staggered mode) ──────────────────────────────────────────
@@ -189,16 +197,22 @@ def build_next_filing_map(df: pd.DataFrame) -> dict[str, list[pd.Timestamp]]:
     )
 
 
-def next_filing_exit(ticker: str, entry_dt: pd.Timestamp,
-                     filing_map: dict, max_hold_days: int) -> pd.Timestamp:
-    """
-    Return the filing_date_used that immediately follows entry_dt for this
-    ticker.  Falls back to entry_dt + max_hold_days if no next filing exists
-    within that cap (e.g. delisting, acquisition, reporting gap).
-    """
-    cap    = entry_dt + pd.Timedelta(days=max_hold_days)
-    future = [d for d in filing_map.get(ticker, []) if d > entry_dt]
-    return min(min(future), cap) if future else cap
+def next_filing_exit(
+        ticker: str,
+        entry_dt: pd.Timestamp,
+        filing_map: dict,
+        # last_price_date: pd.Timestamp
+        ) -> pd.Timestamp | None:
+    
+
+    next_qend = (entry_dt + pd.offsets.QuarterEnd(1)).normalize()
+    # cap    = min(next_qend, last_price_date)
+
+    # future = [d for d in filing_map.get(ticker, []) if entry_dt < d <= last_price_date]
+    # return min(future) if future else cap
+
+    future = [d for d in filing_map.get(ticker, []) if entry_dt < d]
+    return min(min(future), next_qend) if future else next_qend
 
 
 # ── Core backtest ──────────────────────────────────────────────────────────────
@@ -210,7 +224,7 @@ def run_backtest(
     start_date: str,
     end_date: str,
     rebalance_mode: str,
-    max_hold_days: int,
+    # max_hold_days: int,
     min_stocks: int,
     output_dir: Path,
     sector_etf: str | None = None
@@ -234,12 +248,15 @@ def run_backtest(
     elif pre_mask.sum() < 50:
         print(f"[WARN] Only {pre_mask.sum()} rows before cutoff — cleanup stats may be noisy")
         
-    lower, upper, medians, kept = fit_cleanup(df[pre_mask], feat_cols)
-    feats = [f for f in feats if f in kept]
-    print(f"Features available for inference: {len(feats)}")
+    lower, upper, medians = fit_cleanup(df[pre_mask], feat_cols)
+    # feats = [f for f in feats if f in kept]
+    # print(f"Features available for inference: {len(feats)}")
 
     # Staggered: build next-filing lookup over the ENTIRE dataset
     filing_map = build_next_filing_map(df) if rebalance_mode == "staggered" else {}
+
+    # last_price_date = _get_hist("SPY").index.max().normalize()
+    # print(f"Price data available through: {last_price_date.date()}")
 
     quarters = pd.period_range(start=start_date, end=end_date, freq="Q")
     print(f"\nBacktest  {quarters[0]} → {quarters[-1]}  ({len(quarters)} Qs)  "
@@ -260,7 +277,7 @@ def run_backtest(
 
     today = pd.Timestamp.today().normalize()
 
-    for i, q in enumerate(tqdm(quarters, desc="Quarters")):
+    for i, q in enumerate(tqdm(quarters[:-1], desc="Quarters")):
         q_start = q.start_time
         q_end   = q.end_time
 
@@ -272,7 +289,7 @@ def run_backtest(
             continue
 
         # ── Score & select legs ────────────────────────────────────────────────
-        X_inf = apply_cleanup(batch[feat_cols].copy(), lower, upper, medians, kept, feats)
+        X_inf = apply_cleanup(batch[feats].copy(), lower, upper, medians)
         batch = batch.reset_index(drop=True)
         batch["score"] = model.predict(X_inf)
 
@@ -288,31 +305,36 @@ def run_backtest(
         # ── Assign entry / exit dates per mode ────────────────────────────────
         if rebalance_mode == "fixed":
             # Shared rebalance dates: enter at q_end, exit at next quarter-end
-            next_q_end = (quarters[i + 1].end_time
-                          if i + 1 < len(quarters)
-                          else q_end + pd.offsets.QuarterEnd(1))
+            next_q_end = quarters[i+1].end_time
+            # next_q_end = (quarters[i + 1].end_time
+            #               if i + 1 < len(quarters)
+            #               else q_end + pd.offsets.QuarterEnd(1))
             legs = legs.copy()
             legs["entry_dt"] = q_end
-            legs["exit_dt"]  = min(next_q_end, today)
+            legs["exit_dt"]  = next_q_end
         else:  # staggered
             legs = legs.copy()
             legs["entry_dt"] = legs["filing_date_used"]
             legs["exit_dt"]  = legs.apply(
-                lambda r: min(
-                    next_filing_exit(
-                        r["ticker"], r["filing_date_used"], filing_map, max_hold_days),
-                    today,
-                ),
+                lambda r: next_filing_exit(
+                            r["ticker"], r["filing_date_used"], filing_map
+                        ),
                 axis=1,
             )
+
+            # n_before = len(legs)
+            # legs = legs.dropna(subset=["exit_dt"])
+            # n_dropped = n_before - len(legs)
+            # if n_dropped:
+            #     tqdm.write(f"  {q}: dropped {n_dropped} staggered legs with no next filing")
 
         # ── Fetch prices & compute per-position returns ────────────────────────
         rows = []
         n_skipped = 0
-        for _, row in legs.iterrows():
-            ticker   = row["ticker"]
-            entry_dt = row["entry_dt"]
-            exit_dt  = row["exit_dt"]
+        for _, leg in legs.iterrows():
+            ticker   = leg["ticker"]
+            entry_dt = leg["entry_dt"]
+            exit_dt  = leg["exit_dt"]
             if exit_dt <= entry_dt:
                 tqdm.write(f"    skip {ticker}: exit date {exit_dt.date()} <= entry {entry_dt.date()} (position still open)")
                 n_skipped += 1
@@ -333,7 +355,7 @@ def run_backtest(
                 continue
 
             raw_ret = (p_out - p_in) / p_in
-            sign    = 1 if row["direction"] == "long" else -1
+            sign    = 1 if leg["direction"] == "long" else -1
 
             # Per-position SPY alpha over the same window
             spy_in  = price_on("SPY", entry_dt)
@@ -349,7 +371,7 @@ def run_backtest(
             rows.append({
                 "quarter":       str(q),
                 "ticker":        ticker,
-                "direction":     row["direction"],
+                "direction":     leg["direction"],
                 "entry_date":    entry_dt,
                 "exit_date":     exit_dt,
                 "hold_days":     (exit_dt - entry_dt).days,
@@ -361,8 +383,8 @@ def run_backtest(
                 "sector_ret":    sector_ret,
                 "sector_alpha":  sector_alpha,
                 "pos_alpha":     pos_alpha,
-                "score":         row["score"],
-                "target":        row.get("target", np.nan),
+                "score":         leg["score"],
+                "target":        leg.get("target", np.nan),
             })
         trade_records.extend(rows)
 
@@ -377,25 +399,32 @@ def run_backtest(
         # Mean position-level alpha (sign-adjusted, so short alpha = positive when short leg profits)
         alpha   = qdf["pos_alpha"].mean()
 
-        # IC: predicted score vs actual raw return - only within traded quantiles
+        # IC: predicted score vs actual raw return
+        IC_VALID_THROUGH = pd.Period("2025Q2", freq="Q")
+
         cohort_ic = np.nan
-        if "target" in batch.columns:
-            cohort = batch[["score", "target"]]
+        if "target" in batch.columns and q <= IC_VALID_THROUGH:
+            cohort = batch[["score", "target"]].dropna()
             if len(cohort) >= 3:
                 cohort_ic = spearmanr(cohort["score"], cohort["target"]).statistic
                 cohort_ic = float(cohort_ic) if not np.isnan(cohort_ic) else np.nan
+            else:
+                print(f"[WARN] Batch size < 3, skipping Batch IC count for {entry_dt.strftime("%Y-%m-%d")} - {exit_dt.strftime("%Y-%m-%d")}")
+        else:
+            print(f"Quarter: {q} is after 2025Q2, can't derive Batch IC because target is unavailable (requires one year of future data)")
+            
 
         # Tail IC: Only traded positions vs realised backtest return
-        ic_val  = spearmanr(qdf["score"], qdf["raw_return"]).statistic
-        ic_val = float(ic_val) if not np.isnan(ic_val) else np.nan
+        # ic_val  = spearmanr(qdf["score"], qdf["raw_return"]).statistic
+        # ic_val = float(ic_val) if not np.isnan(ic_val) else np.nan
 
-        # Top / bottom leg IC separately
-        top_ic_df = qdf[qdf["direction"] == "long"]
-        bot_ic_df = qdf[qdf["direction"] == "short"]
-        top_ic = float(spearmanr(top_ic_df["score"], top_ic_df["raw_return"]).statistic) \
-                    if len(top_ic_df) >= 3 else np.nan
-        bot_ic = float(spearmanr(bot_ic_df["score"], bot_ic_df["raw_return"]).statistic) \
-                    if len(bot_ic_df) >= 3 else np.nan
+        # # Top / bottom leg IC separately
+        # top_ic_df = qdf[qdf["direction"] == "long"]
+        # bot_ic_df = qdf[qdf["direction"] == "short"]
+        # top_ic = float(spearmanr(top_ic_df["score"], top_ic_df["raw_return"]).statistic) \
+        #             if len(top_ic_df) >= 3 else np.nan
+        # bot_ic = float(spearmanr(bot_ic_df["score"], bot_ic_df["raw_return"]).statistic) \
+        #             if len(bot_ic_df) >= 3 else np.nan
 
         # SPY return for display (mean of per-position SPY windows)
         spy_r = qdf["spy_ret"].mean()
@@ -415,20 +444,25 @@ def run_backtest(
             "sector_ret":   sector_r,
             "sector_alpha": sector_alpha,
             "alpha":        alpha,
-            "ic":           ic_val,
+            # "ic":           ic_val,
             "cohort_ic":    cohort_ic,
-            "top_ic":       top_ic,
-            "bot_ic":       bot_ic,
+            # "top_ic":       top_ic,
+            # "bot_ic":       bot_ic,
         })
         skip_str = f"  [{n_skipped} skipped]" if n_skipped else ""
-        tqdm.write(
-            f"  {q}  n={len(batch):3d}→{len(rows):3d}{skip_str}  "
-            f"long={long_r:+.2%}  "
-            + (f"short={short_r:+.2%}  " if bot_q > 0 else "")
-            + f"comb={comb_r:+.2%}  SPY≈{spy_r:+.2%} "
-            + f"sector≈{sector_r:+.2%}" if sector_etf else ""
-              f"alpha={alpha:+.2%}  IC(tail)={ic_val:+.3f} IC(cohort)={cohort_ic:+.3f}"
+        msg = (
+            f"{q} "
+            f"n={len(batch):3d}→{len(rows):3d}{skip_str} "
+            f"long={long_r:+.2%} "
+            f"{f'short={short_r:+.2%}' if bot_q > 0 else ''} "
+            f"comb={comb_r:+.2%} "
+            f"SPY≈{spy_r:+.2%} "
+            f"{f'sector≈{sector_r:+.2%}' if sector_etf else ''} "
+            f"alpha={alpha:+.2%} "
+            f"IC(Batch)={cohort_ic:+.3f}"
         )
+
+        tqdm.write(msg)
 
     if not quarter_records:
         print("\n[ERROR] No results — check dates, data, and model files.")
@@ -461,12 +495,18 @@ def run_backtest(
     results["cum_combined"] = (1 + results["combined_ret"].fillna(0)).cumprod() - 1
     results["cum_long"]     = (1 + results["long_ret"].fillna(0)).cumprod() - 1
     results["cum_spy"]      = (1 + results["spy_ret"].fillna(0)).cumprod() - 1
-    if "sector_ret" in results.columns:
-        results["cum_sector"] = (1 + results["sector_ret"].fillna(0)).cumprod() - 1
 
     # Drawdown series
-    equity = 1 + results["cum_combined"]
-    results["drawdown"]     = equity / equity.cummax() - 1
+    equity_strat = 1 + results["cum_combined"]
+    equity_spy   = 1 + results["cum_spy"]
+        
+    results["drawdown"]     = equity_strat / equity_strat.cummax() - 1
+    results["drawdown_spy"] = equity_spy / equity_spy.cummax() - 1
+
+    if "sector_ret" in results.columns and results["sector_ret"].notna().any():
+        results["cum_sector"] = (1 + results["sector_ret"].fillna(0)).cumprod() - 1
+        equity_sector = 1 + results["cum_sector"]
+        results["drawdown_sector"] = equity_sector / equity_sector.cummax() - 1
 
     # Rolling 4-quarter Sharpe (min 2 quarters to start showing values)
     ROLL = 4
@@ -475,21 +515,24 @@ def run_backtest(
     )
 
     # Rolling mean IC - use cohort_ic if available, fall back to ic
-    ic_col = "cohort_ic" if "cohort_ic" in results.columns else "ic"
-    results["rolling_ic"] = results[ic_col].rolling(ROLL, min_periods=2).mean()
+    ic_col = "cohort_ic"
+    ic_series = results[ic_col].where(
+        results["quarter"].apply(lambda x: pd.Period(x, freq="Q") <= IC_VALID_THROUGH)
+    )
+    results["rolling_ic"] = ic_series.rolling(ROLL, min_periods=2).mean()
 
-
+    ic_valid = results[results["quarter"].apply(lambda x: pd.Period(x, freq="Q") <= IC_VALID_THROUGH)]
 
     print("\n─── Backtest Summary ────────────────────────────────────────────────")
     print(f"  Mode                  : {rebalance_mode}")
     mean_rf_annual = results["rf_quarterly"].mean() * 4
     print(f"  Risk-free rate (avg)  : {mean_rf_annual:.2%}/yr  (^IRX T-bill)")
     print(f"  Quarters with results : {len(results)} / {len(quarters)}")
-    print(f"  Mean cohort IC        : {results['cohort_ic'].mean():+.4f}  (std={results['cohort_ic'].std():.4f})")
-    print(f"  Mean tail IC (all)   : {results['ic'].mean():+.4f}  (std={results['ic'].std():.4f})")
-    print(f"  Mean tail IC (long)   : {results['top_ic'].mean():+.4f}  (std={results['top_ic'].std():.4f})")
-    if bot_q > 0:
-        print(f"  Mean tail IC (short)   : {results['bot_ic'].mean():+.4f}  (std={results['bot_ic'].std():.4f})")
+    print(f"  Mean Batch IC        : {ic_valid['cohort_ic'].mean():+.4f}  (std={ic_valid['cohort_ic'].std():.4f})")
+    # print(f"  Mean tail IC (all)   : {results['ic'].mean():+.4f}  (std={results['ic'].std():.4f})")
+    # print(f"  Mean tail IC (long)   : {results['top_ic'].mean():+.4f}  (std={results['top_ic'].std():.4f})")
+    # if bot_q > 0:
+    #     print(f"  Mean tail IC (short)   : {results['bot_ic'].mean():+.4f}  (std={results['bot_ic'].std():.4f})")
     print(f"\n  Long leg")
     print(f"    Mean qtrly return   : {results['long_ret'].mean():+.2%}")
     print(f"    Annualised Sharpe   : {sharpe_ann(results['long_ret']):.3f}")
@@ -529,10 +572,13 @@ def run_backtest(
     print(f"Saved → {t_path}")
 
     # ── Plot ───────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(6, 1, figsize=(12, 22), sharex=False)
-    fig.suptitle(f"Backtest: {experiment_name} [{rebalance_mode}]  "
-                 f"({quarters[0]} – {quarters[-1]})",
-                 fontsize=13, fontweight="bold")
+    fig, axes = plt.subplots(6, 1, figsize=(12, 22), constrained_layout=True)
+
+    fig.suptitle(
+        f"Backtest: {experiment_name} [{rebalance_mode}] ({quarters[0]} - {quarters[-1]})",
+        fontsize=13,
+        fontweight="bold"
+    )
 
     # 1. Cumulative returns
     ax = axes[0]
@@ -542,7 +588,7 @@ def run_backtest(
             label="Long only", color="seagreen", lw=1.5, ls="--")
     ax.plot(results["q_start"], results["cum_spy"] * 100,
             label="SPY", color="gray", lw=1.5, ls=":")
-    if "cum_sector" in results.columns:
+    if "cum_sector" in results.columns and results["cum_sector"].notna().any():
         ax.plot(results["q_start"], results["cum_sector"] * 100,
                 label=f"Sector ({sector_etf})", color="darkorange", lw=1.5, ls='-.')
     ax.axhline(0, color="black", lw=0.5)
@@ -563,7 +609,7 @@ def run_backtest(
                 bottom=results["long_ret"] * 100)
     ax2.plot(x, results["spy_ret"] * 100, "o--", color="gray",
              markersize=4, label="SPY", lw=1)
-    if "sector_ret" in results.columns:
+    if "sector_ret" in results.columns and results["sector_ret"].notna().any():
         ax2.plot(x, results["sector_ret"] * 100, "s-.", color="darkorange",
                  markersize=4, label=f"Sector ({sector_etf})", lw=1)
     ax2.axhline(0, color="black", lw=0.5)
@@ -574,18 +620,18 @@ def run_backtest(
 
     # 3. IC per quarter
     ax3 = axes[2]
-    colors = ["seagreen" if v >= 0 else "salmon" for v in results["ic"]]
-    ax3.bar(results["q_start"], results["ic"], width=width, color=colors, alpha=0.8)
-    if "top_ic" in results.columns:
-        ax3.plot(results["q_start"], results["top_ic"], "o--",
-                color="seagreen", markersize=5, lw=1.2, label=f"Long tail IC (mean={results['top_ic'].mean():+.3f})")
-    if bot_q > 0 and "bot_ic" in results.columns:
-        ax3.plot(results["q_start"], results["bot_ic"], "s--",
-                color="salmon", markersize=5, lw=1.2, label=f"Short tail IC (mean={results['bot_ic'].mean():+.3f})")
+    colors = ["seagreen" if v >= 0 else "salmon" for v in ic_series.fillna(0)]
+    ax3.bar(x, ic_series, width=width, color=colors, alpha=0.8)
+    # if "top_ic" in results.columns:
+    #     ax3.plot(x, results["top_ic"], "o--",
+    #             color="seagreen", markersize=5, lw=1.2, label=f"Long tail IC (mean={results['top_ic'].mean():+.3f})")
+    # if bot_q > 0 and "bot_ic" in results.columns:
+    #     ax3.plot(x, results["bot_ic"], "s--",
+    #             color="salmon", markersize=5, lw=1.2, label=f"Short tail IC (mean={results['bot_ic'].mean():+.3f})")
 
     ax3.axhline(0, color="black", lw=0.5)
-    ax3.axhline(results["ic"].mean(), color="steelblue", lw=1.5,
-                ls="--", label=f"Mean IC={results['ic'].mean():+.3f}")
+    ax3.axhline(ic_series.mean(), color="steelblue", lw=1.5,
+                ls="--", label=f"Mean Batch IC={ic_series.mean():+.3f}")
     ax3.set_ylabel("IC (Spearman)")
     ax3.set_title("Per-Quarter IC (score vs realised return)")
     ax3.legend(fontsize=9)
@@ -593,22 +639,29 @@ def run_backtest(
 
     # 4. Drawdown
     ax4 = axes[3]
-    ax4.fill_between(results["q_start"], results["drawdown"] * 100, 0,
-                     color="crimson", alpha=0.4, label="Drawdown")
-    ax4.plot(results["q_start"], results["drawdown"] * 100,
-             color="crimson", lw=1.2)
+    ax4.fill_between(x, results["drawdown"] * 100, 0,
+                    color="crimson", alpha=0.4)
+    ax4.plot(x, results["drawdown"] * 100,
+            color="crimson", lw=2, label="Strategy")
+
+    ax4.plot(x, results["drawdown_spy"] * 100,
+            color="darkorange", lw=2, label="SPY")
+
+    if "drawdown_sector" in results.columns and results["drawdown_sector"].notna().any():
+        ax4.plot(x, results["drawdown_sector"] * 100,
+                color="seagreen", lw=2, label=f"Sector ({sector_etf})")
+        
     ax4.axhline(0, color="black", lw=0.5)
     ax4.set_ylabel("Drawdown (%)")
-    ax4.set_title("Strategy Drawdown (combined L/S)")
+    ax4.set_title("Drawdown comparison")
     ax4.legend(fontsize=9)
     ax4.grid(True, alpha=0.3)
 
     # 5. Rolling Sharpe
     ax5 = axes[4]
-    ax5.plot(results["q_start"], results["rolling_sharpe"],
+    ax5.plot(x, results["rolling_sharpe"],
              color="steelblue", lw=2, label=f"{ROLL}Q Rolling Sharpe")
     ax5.axhline(0, color="black", lw=0.5)
-    ax5.axhline(1.0, color="seagreen", lw=1, ls="--", alpha=0.6, label="Sharpe=1")
     ax5.set_ylabel("Sharpe (annualised)")
     ax5.set_title(f"Rolling {ROLL}-Quarter Sharpe Ratio")
     ax5.legend(fontsize=9)
@@ -616,13 +669,13 @@ def run_backtest(
 
     # 6. Rolling IC
     ax6 = axes[5]
-    ax6.plot(results["q_start"], results["rolling_ic"],
+    ax6.plot(x, results["rolling_ic"],
              color="darkorchid", lw=2, label=f"{ROLL}Q Rolling Mean IC")
     ax6.axhline(0, color="black", lw=0.5)
     ax6.axhline(results[ic_col].mean(), color="gray", lw=1, ls=":",
                 label=f"Overall mean={results[ic_col].mean():+.3f}")
     ax6.set_ylabel("IC (Spearman)")
-    ax6.set_title(f"Rolling {ROLL}-Quarter Mean IC [{ic_col}]")
+    ax6.set_title(f"Rolling {ROLL}-Quarter Mean Batch IC ")
     ax6.legend(fontsize=9)
     ax6.grid(True, alpha=0.3)
 
@@ -631,7 +684,7 @@ def run_backtest(
         ax_.xaxis.set_major_locator(mdates.MonthLocator(bymonth=[1, 4, 7, 10]))
         plt.setp(ax_.xaxis.get_majorticklabels(), rotation=45, ha="right", fontsize=8)
 
-    plt.tight_layout()
+    # plt.tight_layout()
     plot_path = output_dir / f"backtest_{tag}_plot.png"
     plt.savefig(plot_path, dpi=150, bbox_inches="tight")
     print(f"Plot   → {plot_path}")
@@ -687,7 +740,7 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Rebalance modes:\n"
-            "  fixed      Enter entire cohort at quarter-end; exit at next quarter-end.\n"
+            "  fixed      Enter entire Batch at quarter-end; exit at next quarter-end.\n"
             "  staggered  Enter each stock at filing_date_used; exit at its next filing\n"
             "             (capped by --max-hold-days). More realistic signal expiry.\n"
         ),
@@ -706,8 +759,6 @@ if __name__ == "__main__":
                     help="Backtest end date YYYY-MM-DD")
     ap.add_argument("--rebalance",     default="fixed", choices=["fixed", "staggered"],
                     help="Rebalancing mode (default: fixed)")
-    ap.add_argument("--max-hold-days", type=int, default=548,
-                    help="[staggered] Max hold in days if no next filing found (default 548 ≈ 18 mo)")
     ap.add_argument("--min-stocks",    type=int, default=3,
                     help="Skip a quarter if fewer stocks filed (default 3)")
     ap.add_argument("--output-dir",    default="backtest_results",
@@ -725,7 +776,6 @@ if __name__ == "__main__":
         start_date=args.start,
         end_date=args.end,
         rebalance_mode=args.rebalance,
-        max_hold_days=args.max_hold_days,
         min_stocks=args.min_stocks,
         output_dir=Path(args.output_dir),
         sector_etf=args.sector_etf,

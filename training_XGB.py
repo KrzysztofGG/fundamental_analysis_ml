@@ -23,11 +23,12 @@ import xgboost as xgb
 import optuna
 from scipy.stats import spearmanr, rankdata
 from sklearn.base import clone
-from sklearn.feature_selection import RFE, VarianceThreshold
+from sklearn.feature_selection import RFE
 from sklearn.inspection import permutation_importance
-from sklearn.metrics import root_mean_squared_error, r2_score
-from sklearn.preprocessing import StandardScaler
-from tqdm import tqdm
+from tqdm.notebook import tqdm
+
+from training_util import *
+from ensemble import EnsembleModel
 
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
@@ -38,7 +39,7 @@ RESULTS_DIR.mkdir(exist_ok=True)
 CACHE_DIR.mkdir(exist_ok=True)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-N_TRIALS_FULL  = 150
+N_TRIALS_FULL  = 100
 TOP_K          = 100
 RANDOM_STATE   = 42
 
@@ -47,65 +48,7 @@ QUARTER_DAYS = 91    # ~3 months per val slice
 
 BASE_METHODS = ["shap", "rfe", "permutation"]
 
-# ── GPU detection ─────────────────────────────────────────────────────────────
-def _check_gpu() -> bool:
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            print(f"GPU detected: {result.stdout.strip()}")
-            return True
-    except Exception:
-        pass
-    print("No GPU detected — falling back to CPU")
-    return False
-
-DEVICE = "cuda" if _check_gpu() else "cpu"
-
-
-# ── Data loading ───────────────────────────────────────────────────────────────
-def normalize_schema(df: pd.DataFrame) -> pd.DataFrame:
-    date_cols = ["fiscalDateEnding", "filing_date_used"]
-    for col in date_cols:
-        if col in df.columns:
-            df[col] = pd.to_datetime(df[col], errors="coerce")
-    for col in df.columns:
-        if col not in date_cols:
-            try:
-                df[col] = pd.to_numeric(df[col])
-            except Exception:
-                pass
-    for col in ["ticker", "sector", "industry"]:
-        if col in df.columns:
-            df[col] = df[col].astype("string")
-    return df
-
-
-def export_parquets_for_training(
-    data_dir: str = "data_quarterly_parquet",
-    sectors: list | None = None,
-    get_metadata: bool = False
-) -> pd.DataFrame:
-    start = time.time()
-
-    if sectors is None:
-        sectors = [f for f in os.listdir(data_dir)]
-    else:
-        sectors = [f"{name}.parquet" for name in sectors]
-
-    files   = [Path(data_dir) / sector for sector in sectors]
-    dataset = pd.read_parquet(files)
-    dataset["fiscalDateEnding"] = pd.to_datetime(dataset["fiscalDateEnding"])
-    dataset = dataset.sort_values("fiscalDateEnding").reset_index(drop=True)
-
-    if not get_metadata:
-        dataset = dataset.drop(columns=["sector", "industry", "ticker"], errors="ignore")
-
-    print(f"Dataset load time: {(time.time() - start):.2f}s")
-    return dataset
-
+DEVICE = "cuda" if check_gpu() else "cpu"
 
 def generate_parquets_from_csv(data_dir: str = "data_quarterly", max_missing_pct: float = 0.2):
     sectors = [f for f in os.listdir(data_dir) if not f.endswith(".json")]
@@ -142,92 +85,6 @@ def _export_csv_sector(data_dir: str, sector: str) -> pd.DataFrame:
         return dataset
     return pd.DataFrame()
 
-
-# ── Preprocessing ──────────────────────────────────────────────────────────────
-def split_target_with_date_index(df: pd.DataFrame):
-    """Drop target/filing_date_used; set fiscalDateEnding as index."""
-    X = df.drop(columns=["target", "filing_date_used"], errors="ignore")
-    X = X.set_index("fiscalDateEnding")
-    y = df["target"].copy()
-    y.index = X.index
-    return X, y
-
-
-def cleanup_base(X_train: pd.DataFrame, X_test: pd.DataFrame):
-    """Fit on train, apply to test. Clips, fills NaN, drops near-zero-variance."""
-    X_train = X_train.replace([np.inf, -np.inf], np.nan)
-    X_test  = X_test.replace([np.inf, -np.inf], np.nan)
-
-    lower   = X_train.quantile(0.01)
-    upper   = X_train.quantile(0.99)
-    X_train = X_train.clip(lower=lower, upper=upper, axis=1)
-    X_test  = X_test.clip(lower=lower, upper=upper, axis=1)
-
-    medians = X_train.median()
-    X_train = X_train.fillna(medians)
-    X_test  = X_test.fillna(medians)
-
-    selector = VarianceThreshold(threshold=1e-5)
-    mask     = selector.fit(X_train).get_support()
-    cols     = X_train.columns[mask]
-    return X_train[cols], X_test[cols]
-
-
-def rank_target_cross_sectionally(y: pd.Series) -> pd.Series:
-    """
-    Rank target within each fiscal quarter (date bin).
-    y must have a fiscalDateEnding DatetimeIndex.
-    """
-    bins   = pd.PeriodIndex(y.index, freq="Q").asi8
-    ranked = y.copy().astype(float)
-    for b in np.unique(bins):
-        mask = bins == b
-        if mask.sum() < 2:
-            continue
-        ranked.iloc[mask] = rankdata(y.iloc[mask]) / mask.sum()
-    return ranked
-
-
-# def add_cross_sectional_ranks(
-#     df: pd.DataFrame,
-#     group_cols: list = ["fiscalDateEnding", "sector"],
-#     min_group_size: int = 5,
-# ) -> pd.DataFrame:
-#     metadata_cols = ["ticker", "sector", "industry", "fiscalDateEnding", "filing_date_used", "target"]
-#     feature_cols  = [c for c in df.columns if c not in metadata_cols]
-
-#     print(f"Cross-sectional ranking {len(feature_cols)} features "
-#           f"across {df['fiscalDateEnding'].nunique()} dates "
-#           f"x {df['sector'].nunique()} sectors...")
-
-#     ranked       = df.copy()
-#     group_sizes  = df.groupby(group_cols)["sector"].transform("size")
-#     large_enough = group_sizes >= min_group_size
-
-#     thin_groups = (
-#         df.groupby(group_cols).size()
-#         .reset_index(name="n")
-#         .query("n < @min_group_size")
-#     )
-#     if len(thin_groups) > 0:
-#         print(f"  Warning: {len(thin_groups)} sector x date groups have "
-#               f"< {min_group_size} stocks — using date-only rank as fallback")
-
-#     for col in tqdm(feature_cols, desc="  Ranking features", leave=False):
-#         sector_date_rank = df.groupby(group_cols)[col].rank(pct=True, na_option="keep")
-#         date_only_rank   = df.groupby("fiscalDateEnding")[col].rank(pct=True, na_option="keep")
-#         ranked[col]      = np.where(large_enough, sector_date_rank, date_only_rank)
-
-#     return ranked
-
-
-# ── Feature selection ──────────────────────────────────────────────────────────
-def _ic_scorer(estimator, X, y):
-    preds = estimator.predict(X)
-    ic, _ = spearmanr(y, preds)
-    return ic if not np.isnan(ic) else 0.0
-
-
 def method_shap(X_tr, y_tr, base_reg, top_k=TOP_K):
     model = clone(base_reg).fit(X_tr, y_tr)
     sv    = shap.TreeExplainer(model).shap_values(X_tr)
@@ -245,7 +102,7 @@ def method_permutation(X_tr, y_tr, base_reg, top_k=TOP_K, n_repeats=5):
     model = clone(base_reg).fit(X_tr, y_tr)
     res   = permutation_importance(
         model, X_tr, y_tr, n_repeats=n_repeats,
-        random_state=RANDOM_STATE, scoring=_ic_scorer,
+        random_state=RANDOM_STATE, scoring=ic_scorer,
     )
     idx = np.argsort(res.importances_mean)[-top_k:]
     return X_tr.columns[idx].tolist()
@@ -314,11 +171,6 @@ def load_or_run_feature_selection(
     return methods
 
 
-# ── CV ─────────────────────────────────────────────────────────────────────────
-def _assign_quarter_bins(dates: pd.DatetimeIndex) -> np.ndarray:
-    return pd.PeriodIndex(dates, freq="Q").asi8
-
-
 def quick_cv_ic_gapped(
     feats: list[str],
     X_tr: pd.DataFrame,
@@ -330,7 +182,7 @@ def quick_cv_ic_gapped(
 ) -> tuple[float, float, float]:
     """Walk-forward IC CV with fixed-width training window and explicit gap."""
     dates     = X_tr.index.sort_values().unique()
-    bin_index = _assign_quarter_bins(dates)
+    bin_index = assign_quarter_bins(dates)
 
     unique_bins = np.unique(bin_index)
     bin_start: dict[int, pd.Timestamp] = {}
@@ -398,64 +250,6 @@ def quick_cv_ic_gapped(
     mean_ic, std_ic, mean_rmse = np.mean(fold_ics), np.std(fold_ics), np.mean(fold_rmses)
     print(f"\n[RESULT] {len(fold_ics)} folds | IC={mean_ic:.4f} ± {std_ic:.4f} | RMSE={mean_rmse:.4f}")
     return mean_ic, std_ic, mean_rmse
-
-
-# ── Ensemble ───────────────────────────────────────────────────────────────────
-class EnsembleModel:
-    """
-    Weighted rank-average ensemble of XGBoost regressors.
-    Each model scores independently; scores are percentile-ranked within the
-    batch, then combined as a weighted average by CV IC.
-    Exposes .predict(X) as a drop-in replacement for a single XGBRegressor.
-    X passed to .predict() must contain all columns needed by all sub-models.
-    """
-    def __init__(self, models: list[xgb.XGBRegressor],
-                 feature_lists: list[list[str]],
-                 weights: list[float]):
-        total = sum(weights)
-        self.models        = models
-        self.feature_lists = feature_lists
-        self.weights       = [w / total for w in weights]
-
-    def predict(self, X: pd.DataFrame) -> np.ndarray:
-        n   = len(X)
-        agg = np.zeros(n)
-        for model, feats, w in zip(self.models, self.feature_lists, self.weights):
-            raw   = model.predict(X[feats])
-            ranks = rankdata(raw) / n
-            agg  += w * ranks
-        return agg
-
-
-# ── Scorecard ──────────────────────────────────────────────────────────────────
-def compute_scorecard(reg_model, X, y_reg, split_name="val"):
-    reg_preds = reg_model.predict(X)
-    preds_s   = pd.Series(reg_preds, index=y_reg.index)
-    bins      = pd.PeriodIndex(y_reg.index, freq="Q").asi8
-
-    period_ics = []
-    for b in np.unique(bins):
-        mask = bins == b
-        if mask.sum() < 5:
-            continue
-        ic, _ = spearmanr(y_reg.values[mask], preds_s.values[mask])
-        if not np.isnan(ic):
-            period_ics.append(ic)
-
-    mean_ic = float(np.mean(period_ics)) if period_ics else 0.0
-    std_ic  = float(np.std(period_ics))  if period_ics else 0.0
-    icir    = mean_ic / std_ic if std_ic > 0 else 0.0
-    global_ic, _ = spearmanr(y_reg, reg_preds)
-
-    return {
-        f"{split_name}_ic":        mean_ic,
-        f"{split_name}_icir":      icir,
-        f"{split_name}_ic_std":    std_ic,
-        f"{split_name}_ic_global": global_ic,
-        f"{split_name}_rmse":      root_mean_squared_error(y_reg, reg_preds),
-        f"{split_name}_r2":        r2_score(y_reg, reg_preds),
-    }
-
 
 # ── Optuna objective ───────────────────────────────────────────────────────────
 def make_objective(features, X_train, y_train, gap_days=GAP_DAYS):

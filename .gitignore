@@ -1,7 +1,7 @@
 cache/
-data_quarterly/
+data_quarterly*/
 data_quarterly_parquet/
-data_yearly/
+data_yearly*/
 data_yearly_parquet/
 price_cache/
 raw_data/
@@ -13,3 +13,4 @@ data_quarterly_parquet.7z
 raw_data.7z
 optuna_studies.*
 *.ubj
+us_stock_listing*

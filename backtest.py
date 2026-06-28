@@ -36,12 +36,13 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import xgboost as xgb
-from scipy.stats import spearmanr, rankdata
+from scipy.stats import spearmanr
 from util import get_price_history, lookup_price
 from sklearn.feature_selection import VarianceThreshold
-from tqdm import tqdm
+from tqdm.notebook import tqdm
 
-from util_training import *
+from training_util import *
+from ensemble import EnsembleModel, apply_cleanup
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 RESULTS_DIR = Path("results_v2")
@@ -67,6 +68,36 @@ SECTOR_ETF_MAP: dict[str, str] = {
     "utilities": "XLU"
 }
 
+# class EnsembleModel:
+#     def __init__(self, models, feature_lists, weights):
+#         total = sum(weights)
+#         self.models = models
+#         self.feature_lists = feature_lists
+#         self.weights = [w / total for w in weights]
+
+#     def predict(self, X):
+#         from scipy.stats import rankdata as _rd
+#         n, agg = len(X), np.zeros(len(X))
+#         for model, feats, w in zip(self.models, self.feature_lists, self.weights):
+#             # TODO: CHECK THIS LOGIC
+#             agg += w * (_rd(model.predict(X[feats])) / n)
+#         return agg
+    
+#     def retrain(self, batch: pd.DataFrame, lower: pd.Series,
+#                 upper: pd.Series, medians: pd.Series):
+#         """Incrementally retrain each member on it's own feature subset."""
+#         for i, (model, feats) in enumerate(zip(self.models, self.feature_lists)):
+#             valid = batch.dropna(subset=["target"] + feats)
+#             if len(valid) < 5:
+#                 tqdm.write(f"  [retrain] ensemble member {i}: only {len(valid)} rows - skipping")
+
+#             X_new = apply_cleanup(valid[feats].copy(), lower, upper, medians)
+#             y_new = valid["target"].copy()
+#             y_new.index = valid["fiscalDateEnding"].values
+#             y_new = rank_target_cross_sectionally(y_new)
+#             model.fit(X_new, y_new, xgb_model=model.get_booster())
+#             tqdm.write(f"  [retrain] ensemble member {i}: fit on {len(valid)} rows")
+
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 def load_model_and_meta(experiment_name: str):
@@ -78,15 +109,10 @@ def load_model_and_meta(experiment_name: str):
         raise FileNotFoundError(f"Meta not found: {meta_path}")
     with open(meta_path) as f:
         meta = json.load(f)
-
-    if not reg_path.exists():
-        raise FileNotFoundError(
-            f"Model not found: {reg_path}\n"
-            "Run training.ipynb first to produce the .ubj file.")
     
     sc = meta["scores"]
 
-    if meta.get("mode") == "ensemble":
+    if meta.get("mode", "") == "ensemble":
         models, feats_list, weights = [], [], []
         for method_name in meta["ensemble_methods"]:
             p = RESULTS_DIR / f"final_{experiment_name}_reg_{method_name}.ubj"
@@ -94,28 +120,18 @@ def load_model_and_meta(experiment_name: str):
             m.load_model(p)
             models.append(m)
             feats_list.append(meta["ensemble_feats"][method_name])
-            weights.append(meta["ensemble_weights"][meta["ensemble_methods"].index(method_name)])
-
-        class _Ensemble:
-            def __init__(self, models, feature_lists, weights):
-                total = sum(weights)
-                self.models = models
-                self.feature_lists = feature_lists
-                self.weights = [w / total for w in weights]
-
-            def predict(self, X):
-                from scipy.stats import rankdata as _rd
-                n, agg = len(X), np.zeros(len(X))
-                for model, feats, w in zip(self.models, self.feature_lists, self.weights):
-                    # TODO: CHECK THIS LOGIC
-                    agg += w * (_rd(model.predict(X[feats])) / n)
-                return agg
+            weights.append(meta["ensemble_weights"][meta["ensemble_methods"].index(method_name)])        
             
-        model = _Ensemble(models, feats_list, weights)
+        model = EnsembleModel(models, feats_list, weights)
         print(f"Loaded ensemble [{experiment_name}]  "
               f"({len(models)} models | train IC={sc['test_ic']:.4f}) "
               f"ICIR={sc['test_icir']:.4f}")
     else:  
+        if not reg_path.exists():
+            raise FileNotFoundError(
+                f"Model not found: {reg_path}\n"
+                "Run training.ipynb first to produce the .ubj file.")
+        
         model = xgb.XGBRegressor()
         model.load_model(reg_path)
         sc = meta["scores"]
@@ -185,16 +201,6 @@ def fit_cleanup(df_ref: pd.DataFrame, feat_cols: list[str]):
     # kept = X.columns[sel.get_support()].tolist()
     return lower, upper, medians
 
-
-def apply_cleanup(X: pd.DataFrame,
-                  lower: pd.Series, upper: pd.Series,
-                  medians: pd.Series
-                  ) -> pd.DataFrame:
-    X = X.replace([np.inf, -np.inf], np.nan)
-    X = X.clip(lower=lower, upper=upper, axis=1)
-    X = X.fillna(medians)
-    return X
-
 def retrain_on_batch(model: xgb.XGBRegressor,
                      batch: pd.DataFrame,
                      feats: list[str],
@@ -206,6 +212,12 @@ def retrain_on_batch(model: xgb.XGBRegressor,
     Requires 'target' and 'fiscalDateEnding' columns in batch.
     Returns the updated model (same object, mutated in-place by XGBoost).
     """
+
+    if isinstance(model, EnsembleModel):
+        model.retrain(batch, lower, upper, medians)
+        return model
+    
+    # Single model path
     valid = batch.dropna(subset=["target"] + feats)
     if len(valid) < 5:
         tqdm.write(f"  [retrain] only {len(valid)} rows with valid target - skipping")
@@ -356,10 +368,10 @@ def run_backtest(
         # X_inf = apply_cleanup(batch[feats].copy(), lower, upper, medians)
         # batch = batch.reset_index(drop=True)
         # batch["score"] = model.predict(X_inf)
-        inf_cols = feat_cols if meta.get("mode") == "ensemble" else feats
+        inf_cols = feat_cols if meta.get("mode", "") == "ensemble" else feats
         X_inf = apply_cleanup(batch[inf_cols].copy(), lower, upper, medians)
         batch = batch.reset_index(drop=True)
-        batch["score"] = model.prefict(X_inf)
+        batch["score"] = model.predict(X_inf)
 
         ranked = batch.sort_values("score", ascending=False).reset_index(drop=True)
         top_n  = max(1, int(np.ceil(len(ranked) * top_q)))
@@ -651,15 +663,23 @@ def run_backtest(
 
     # 1. Cumulative returns
     ax = axes[0]
+
+    final_combined = results["cum_combined"].iloc[-1] * 100
+    final_spy = results["cum_spy"].iloc[-1] * 100
+
     ax.plot(results["q_start"], results["cum_combined"] * 100,
-            label="Strategy (combined)", color="steelblue", lw=2)
-    ax.plot(results["q_start"], results["cum_long"] * 100,
-            label="Long only", color="seagreen", lw=1.5, ls="--")
+            label=f"Strategy  {final_combined:+.1f}%", color="steelblue", lw=2)
+    if bot_q > 0:
+        final_long = results["cum_long"].iloc[-1] * 100
+        ax.plot(results["q_start"], results["cum_long"] * 100,
+                label=f"Long only  {final_long:+.1f}%", color="seagreen", lw=1.5, ls="--")
     ax.plot(results["q_start"], results["cum_spy"] * 100,
-            label="SPY", color="gray", lw=1.5, ls=":")
+            label=f"SPY  {final_spy:+.1f}%", color="gray", lw=1.5, ls=":")
     if "cum_sector" in results.columns and results["cum_sector"].notna().any():
+        final_sector = results["cum_sector"].dropna().iloc[-1] * 100
         ax.plot(results["q_start"], results["cum_sector"] * 100,
-                label=f"Sector ({sector_etf})", color="darkorange", lw=1.5, ls='-.')
+                label=f"Sector ({sector_etf})  {final_sector:+.1f}%",
+                color="darkorange", lw=1.5, ls='-.')
     ax.axhline(0, color="black", lw=0.5)
     ax.set_ylabel("Cumulative Return (%)")
     ax.set_title("Cumulative Return")

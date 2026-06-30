@@ -12,7 +12,6 @@ scores, ensemble, best_feats = training_pipeline(df, STUDY_STORAGE, False, "full
 
 import json
 import os
-import subprocess
 import time
 from pathlib import Path
 
@@ -21,7 +20,7 @@ import pandas as pd
 import shap
 import xgboost as xgb
 import optuna
-from scipy.stats import spearmanr, rankdata
+from scipy.stats import spearmanr
 from sklearn.base import clone
 from sklearn.feature_selection import RFE
 from sklearn.inspection import permutation_importance
@@ -34,21 +33,9 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 RESULTS_DIR = Path("results_v2")
-CACHE_DIR   = Path("cache")
 RESULTS_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
-
-# ── Config ────────────────────────────────────────────────────────────────────
-N_TRIALS_FULL  = 100
-TOP_K          = 100
-RANDOM_STATE   = 42
-
-GAP_DAYS     = 456   # 12-month return horizon + 3-month filing buffer (≥ 365+91)
-QUARTER_DAYS = 91    # ~3 months per val slice
 
 BASE_METHODS = ["shap", "rfe", "permutation"]
-
-DEVICE = "cuda" if check_gpu() else "cpu"
 
 def generate_parquets_from_csv(data_dir: str = "data_quarterly", max_missing_pct: float = 0.2):
     sectors = [f for f in os.listdir(data_dir) if not f.endswith(".json")]
@@ -378,21 +365,27 @@ def training_pipeline(
 
     TEST_MONTHS = 24
     GAP         = pd.Timedelta(days=GAP_DAYS)
-    data_end    = df["fiscalDateEnding"].max()
+    # data_end    = df["fiscalDateEnding"].max()
 
-    test_end     = data_end
-    test_start   = data_end - pd.DateOffset(months=TEST_MONTHS)
-    train_cutoff = test_start - GAP
+    # test_end     = data_end
+    # test_start   = data_end - pd.DateOffset(months=TEST_MONTHS)
+    # train_cutoff = test_start - GAP
 
+    # print(f"Train pool : up to  {train_cutoff.strftime('%Y-%m-%d')}")
+    # print(f"Gap        : {GAP.days}d  →  {test_start.strftime('%Y-%m-%d')}")
+    # print(f"Test       : {test_start.strftime('%Y-%m-%d')}  →  {test_end.strftime('%Y-%m-%d')}")
+    # print(f"Train rows : {(df['fiscalDateEnding'] <= train_cutoff).sum()}")
+    # print(f"Test rows  : {((df['fiscalDateEnding'] >= test_start) & (df['fiscalDateEnding'] <= test_end)).sum()}")
+
+    # train_df = df[df["fiscalDateEnding"] <= train_cutoff].copy()
+    # test_df  = df[(df["fiscalDateEnding"] >= test_start) &
+    #               (df["fiscalDateEnding"] <= test_end)].copy()
+    train_df, test_df, train_cutoff, test_start, test_end = derive_train_test_split(df, test_months=TEST_MONTHS, gap_days=GAP_DAYS)
     print(f"Train pool : up to  {train_cutoff.strftime('%Y-%m-%d')}")
     print(f"Gap        : {GAP.days}d  →  {test_start.strftime('%Y-%m-%d')}")
     print(f"Test       : {test_start.strftime('%Y-%m-%d')}  →  {test_end.strftime('%Y-%m-%d')}")
     print(f"Train rows : {(df['fiscalDateEnding'] <= train_cutoff).sum()}")
     print(f"Test rows  : {((df['fiscalDateEnding'] >= test_start) & (df['fiscalDateEnding'] <= test_end)).sum()}")
-
-    train_df = df[df["fiscalDateEnding"] <= train_cutoff].copy()
-    test_df  = df[(df["fiscalDateEnding"] >= test_start) &
-                  (df["fiscalDateEnding"] <= test_end)].copy()
 
     X_train_raw, y_reg_train_raw = split_target_with_date_index(train_df)
     X_test_raw,  y_reg_test_raw  = split_target_with_date_index(test_df)
@@ -419,13 +412,13 @@ def training_pipeline(
         force_feature_selection, experiment_name,
     )
 
-    print(f"\n  {'method':<12}  {'n_feats':>7}  {'mean_IC':>8}  {'std_IC':>7}  {'ICIR':>6}  {'RMSE':>7}")
-    print(f"  {'-'*12}  {'-'*7}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}")
-    for name, feats in methods.items():
-        mean_ic, std_ic, mean_rmse = quick_cv_ic_gapped(feats, X_train, y_reg_train, base_reg)
-        icir = mean_ic / std_ic if std_ic > 0 else 0.0
-        print(f"  {name:<12}  {len(feats):>7}  {mean_ic:>8.4f}  "
-              f"{std_ic:>7.4f}  {icir:>6.3f}  {mean_rmse:>7.4f}")
+    # print(f"\n  {'method':<12}  {'n_feats':>7}  {'mean_IC':>8}  {'std_IC':>7}  {'ICIR':>6}  {'RMSE':>7}")
+    # print(f"  {'-'*12}  {'-'*7}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}")
+    # for name, feats in methods.items():
+    #     mean_ic, std_ic, mean_rmse = quick_cv_ic_gapped(feats, X_train, y_reg_train, base_reg)
+    #     icir = mean_ic / std_ic if std_ic > 0 else 0.0
+    #     print(f"  {name:<12}  {len(feats):>7}  {mean_ic:>8.4f}  "
+    #           f"{std_ic:>7.4f}  {icir:>6.3f}  {mean_rmse:>7.4f}")
 
     # ── Optuna pass — one study per method ───────────────────────────────────
     print("\n─── Optuna pass (all methods) ────────────────────────────")

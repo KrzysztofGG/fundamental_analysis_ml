@@ -29,7 +29,7 @@ import argparse
 import json
 import sys
 from pathlib import Path
-from datetime import datetime
+
 
 import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
@@ -42,62 +42,11 @@ from sklearn.feature_selection import VarianceThreshold
 from tqdm.notebook import tqdm
 
 from training_util import *
+from backtest_util import *
 from ensemble import EnsembleModel, apply_cleanup
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 RESULTS_DIR = Path("results_v2")
-PRICE_CACHE = Path("price_cache")
-DATA_DIR    = Path("data_quarterly_to_present_parquet")
-# DATA_DIR    = Path("data_quarterly_parquet")
-PRICE_CACHE.mkdir(exist_ok=True)
-
-METADATA_COLS = {"ticker", "sector", "industry", "fiscalDateEnding",
-                 "filing_date_used", "target"}
-
-SECTOR_ETF_MAP: dict[str, str] = {
-    "basic_materials": "XLB",
-    "communication_services": "XLC",
-    "consumer_cyclical": "XLY",
-    "consumer_defensive": "XLP",
-    "energy": "XLE",
-    "financial_services": "XLF",
-    "healthcare": "XLV",
-    "industrials": "XLI",
-    "real_estate": "XLRE",
-    "technology": "XLK",
-    "utilities": "XLU"
-}
-
-# class EnsembleModel:
-#     def __init__(self, models, feature_lists, weights):
-#         total = sum(weights)
-#         self.models = models
-#         self.feature_lists = feature_lists
-#         self.weights = [w / total for w in weights]
-
-#     def predict(self, X):
-#         from scipy.stats import rankdata as _rd
-#         n, agg = len(X), np.zeros(len(X))
-#         for model, feats, w in zip(self.models, self.feature_lists, self.weights):
-#             # TODO: CHECK THIS LOGIC
-#             agg += w * (_rd(model.predict(X[feats])) / n)
-#         return agg
-    
-#     def retrain(self, batch: pd.DataFrame, lower: pd.Series,
-#                 upper: pd.Series, medians: pd.Series):
-#         """Incrementally retrain each member on it's own feature subset."""
-#         for i, (model, feats) in enumerate(zip(self.models, self.feature_lists)):
-#             valid = batch.dropna(subset=["target"] + feats)
-#             if len(valid) < 5:
-#                 tqdm.write(f"  [retrain] ensemble member {i}: only {len(valid)} rows - skipping")
-
-#             X_new = apply_cleanup(valid[feats].copy(), lower, upper, medians)
-#             y_new = valid["target"].copy()
-#             y_new.index = valid["fiscalDateEnding"].values
-#             y_new = rank_target_cross_sectionally(y_new)
-#             model.fit(X_new, y_new, xgb_model=model.get_booster())
-#             tqdm.write(f"  [retrain] ensemble member {i}: fit on {len(valid)} rows")
-
 
 # ── Data loading ───────────────────────────────────────────────────────────────
 def load_model_and_meta(experiment_name: str):
@@ -140,67 +89,6 @@ def load_model_and_meta(experiment_name: str):
             f"ICIR={sc['test_icir']:.4f})")
     return model, meta
 
-
-def load_dataset(sectors: list[str] | None, data_dir: Path = DATA_DIR) -> pd.DataFrame:
-    if not data_dir.exists():
-        raise FileNotFoundError(f"Data dir not found: {data_dir}")
-    files = ([data_dir / f"{s}.parquet" for s in sectors]
-             if sectors else list(data_dir.glob("*.parquet")))
-    missing = [f for f in files if not f.exists()]
-    if missing:
-        raise FileNotFoundError(f"Missing parquet(s): {missing}")
-    df = pd.read_parquet(files)
-    df["fiscalDateEnding"] = pd.to_datetime(df["fiscalDateEnding"])
-    df["filing_date_used"] = pd.to_datetime(df["filing_date_used"])
-    print(f"Dataset: {len(df):,} rows | {df['ticker'].nunique():,} tickers"
-          if "ticker" in df.columns else f"Dataset: {len(df):,} rows (no ticker col)")
-    return df
-
-
-# ── Price helpers ──────────────────────────────────────────────────────────────
-# Reuses util.get_price_history (disk cache + exponential-backoff retries) and
-# util.lookup_price (forward-window close lookup with error printing).
-# In-memory dict avoids repeated parquet reads within a single backtest run.
-_hist_cache: dict[str, pd.DataFrame | None] = {}
-
-def _get_hist(ticker: str) -> pd.DataFrame | None:
-    if ticker not in _hist_cache:
-        _hist_cache[ticker] = get_price_history(ticker)
-    return _hist_cache[ticker]
-
-
-def price_on(ticker: str, date: pd.Timestamp, window: int = 5) -> float | None:
-    return lookup_price(_get_hist(ticker), date, window_days=window)
-
-def fetch_rf_quarterly(start_date: str, end_date: str) -> pd.Series:
-    """
-    Returns quarterly risk-free reates derived from the 13-week T-bill yield (^IRX).
-    Index is quarter period strings e.g. '2022Q1'. Falls back to empty Series (rf=0)
-    """
-    hist = get_price_history("^IRX")
-    if hist is None:
-        print("[WARN] Could not fetch ^IRX T-bill rates - Sharpe will use rf=0")
-        return pd.Series(dtype=float)
-    
-    annual_rate = hist['Close'] / 100.0
-    quarterly_annual = annual_rate.resample("QE").mean()
-    rf_q = (1 + quarterly_annual) ** (1 / 4) - 1
-    rf_q.index = rf_q.index.to_period("Q").astype(str)
-    valid = pd.period_range(start=start_date, end=end_date, freq="Q").astype(str)
-    return rf_q.reindex(valid)
-
-
-# ── Preprocessing ──────────────────────────────────────────────────────────────
-def fit_cleanup(df_ref: pd.DataFrame, feat_cols: list[str]):
-    X = df_ref[feat_cols].replace([np.inf, -np.inf], np.nan)
-    lower   = X.quantile(0.01)
-    upper   = X.quantile(0.99)
-    medians = X.median()
-    # sel     = VarianceThreshold(threshold=1e-5)
-    # sel.fit(X.fillna(medians))
-    # kept = X.columns[sel.get_support()].tolist()
-    return lower, upper, medians
-
 def retrain_on_batch(model: xgb.XGBRegressor,
                      batch: pd.DataFrame,
                      feats: list[str],
@@ -232,60 +120,6 @@ def retrain_on_batch(model: xgb.XGBRegressor,
     tqdm.write(f"  [retrain] fitten on {len(valid)} rows")
     return model
 
-
-# ── Test-window inference ─────────────────────────────────────────────────────
-def infer_test_window(df: pd.DataFrame,
-                      test_months: int = 24) -> tuple[str, str]:
-    """
-    Derive the test-set date range from the dataset, mirroring the training
-    pipeline split (last `test_months` months by filing_date_used).
-
-    Returns (start_date, end_date) as 'YYYY-MM-DD' strings ready for run_backtest.
-    """
-    # start_date = max_date - pd.DateOffset(months=test_months)
-    end_date   = df["filing_date_used"].max() - pd.DateOffset(month=3)
-    # end_date = datetime.strptime("2025-12-31", "%Y-%m-%d").date()
-
-    start_date = datetime.strptime("2023-03-31", "%Y-%m-%d").date()
-    # print("[WARN] Using hardcoded backtest start date")
-
-    return (
-        start_date.strftime("%Y-%m-%d"),
-        end_date.strftime("%Y-%m-%d")
-    )
-
-
-# ── Next-filing map (staggered mode) ──────────────────────────────────────────
-def build_next_filing_map(df: pd.DataFrame) -> dict[str, list[pd.Timestamp]]:
-    """
-    For each ticker return its chronologically sorted list of filing_date_used
-    timestamps.  Used in staggered mode to find the next filing after an entry.
-    """
-    return (
-        df.groupby("ticker")["filing_date_used"]
-        .apply(lambda s: sorted(s.tolist()))
-        .to_dict()
-    )
-
-
-def next_filing_exit(
-        ticker: str,
-        entry_dt: pd.Timestamp,
-        filing_map: dict,
-        # last_price_date: pd.Timestamp
-        ) -> pd.Timestamp | None:
-    
-
-    next_qend = (entry_dt + pd.offsets.QuarterEnd(1)).normalize()
-    # cap    = min(next_qend, last_price_date)
-
-    # future = [d for d in filing_map.get(ticker, []) if entry_dt < d <= last_price_date]
-    # return min(future) if future else cap
-
-    future = [d for d in filing_map.get(ticker, []) if entry_dt < d]
-    return min(min(future), next_qend) if future else next_qend
-
-
 # ── Core backtest ──────────────────────────────────────────────────────────────
 def run_backtest(
     experiment_name: str,
@@ -295,7 +129,6 @@ def run_backtest(
     start_date: str,
     end_date: str,
     rebalance_mode: str,
-    # max_hold_days: int,
     min_stocks: int,
     output_dir: Path,
     sector_etf: str | None = None
@@ -320,14 +153,9 @@ def run_backtest(
         print(f"[WARN] Only {pre_mask.sum()} rows before cutoff — cleanup stats may be noisy")
         
     lower, upper, medians = fit_cleanup(df[pre_mask], feat_cols)
-    # feats = [f for f in feats if f in kept]
-    # print(f"Features available for inference: {len(feats)}")
 
     # Staggered: build next-filing lookup over the ENTIRE dataset
     filing_map = build_next_filing_map(df) if rebalance_mode == "staggered" else {}
-
-    # last_price_date = _get_hist("SPY").index.max().normalize()
-    # print(f"Price data available through: {last_price_date.date()}")
 
     quarters = pd.period_range(start=start_date, end=end_date, freq="Q")
     print(f"\nBacktest  {quarters[0]} → {quarters[-1]}  ({len(quarters)} Qs)  "
@@ -346,7 +174,6 @@ def run_backtest(
     quarter_records: list[dict] = []
     trade_records:   list[dict] = []
 
-    # today = pd.Timestamp.today().normalize()
     prev_batch: pd.DataFrame | None = None
 
     for i, q in enumerate(tqdm(quarters[:-1], desc="Quarters")):
@@ -355,7 +182,17 @@ def run_backtest(
 
         # Incremental retrain on previous quarter's completed batch
         if rebalance_mode == "fixed" and prev_batch is not None:
-            model = retrain_on_batch(model, prev_batch, feats, lower, upper, medians)
+            # model = retrain_on_batch(model, prev_batch, feats, lower, upper, medians)
+            trainable_cutoff = q_start - pd.Timedelta(GAP_DAYS)
+
+            matured_start = trainable_cutoff - pd.DateOffset(months=3)
+            matured_batch = df[(df["filing_date_used"] > matured_start) &
+                               (df["filing_date_used"] <= trainable_cutoff)].copy()
+            
+            if len(matured_batch) > 0:
+                model = retrain_on_batch_mlp(model, matured_batch, feats, lower, upper, medians)
+            else:
+                print(f"[retrain] No matured rows to retrain model on")
 
         batch = df[(df["filing_date_used"] >= q_start) &
                    (df["filing_date_used"] <= q_end)].copy()
@@ -365,9 +202,6 @@ def run_backtest(
             continue
 
         # ── Score & select legs ────────────────────────────────────────────────
-        # X_inf = apply_cleanup(batch[feats].copy(), lower, upper, medians)
-        # batch = batch.reset_index(drop=True)
-        # batch["score"] = model.predict(X_inf)
         inf_cols = feat_cols if meta.get("mode", "") == "ensemble" else feats
         X_inf = apply_cleanup(batch[inf_cols].copy(), lower, upper, medians)
         batch = batch.reset_index(drop=True)
@@ -386,9 +220,6 @@ def run_backtest(
         if rebalance_mode == "fixed":
             # Shared rebalance dates: enter at q_end, exit at next quarter-end
             next_q_end = quarters[i+1].end_time
-            # next_q_end = (quarters[i + 1].end_time
-            #               if i + 1 < len(quarters)
-            #               else q_end + pd.offsets.QuarterEnd(1))
             legs = legs.copy()
             legs["entry_dt"] = q_end
             legs["exit_dt"]  = next_q_end
@@ -401,12 +232,6 @@ def run_backtest(
                         ),
                 axis=1,
             )
-
-            # n_before = len(legs)
-            # legs = legs.dropna(subset=["exit_dt"])
-            # n_dropped = n_before - len(legs)
-            # if n_dropped:
-            #     tqdm.write(f"  {q}: dropped {n_dropped} staggered legs with no next filing")
 
         # ── Fetch prices & compute per-position returns ────────────────────────
         rows = []

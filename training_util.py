@@ -9,6 +9,59 @@ from scipy.stats import spearmanr, rankdata
 from sklearn.feature_selection import VarianceThreshold
 from sklearn.metrics import root_mean_squared_error, r2_score
 
+CACHE_DIR   = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
+
+# ── Config ────────────────────────────────────────────────────────────────────
+N_TRIALS_FULL  = 100
+TOP_K          = 100
+RANDOM_STATE   = 42
+
+GAP_DAYS     = 456   # 12-month return horizon + 3-month filing buffer (≥ 365+91)
+QUARTER_DAYS = 91    # ~3 months per val slice
+
+def derive_train_test_split(
+    df: pd.DataFrame,
+    test_months: int = 24,
+    gap_days: int = GAP_DAYS,
+    anchor_date: pd.Timestamp | None = None,  # explicit override
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    """
+    Canonical train/test split.
+    
+    anchor_date: the data_end used to compute the split. If None, derived from
+    df["fiscalDateEnding"].max() — use this form in training. In backtesting,
+    pass the training data's original anchor explicitly so the split is identical
+    to what the model was trained on, even if df contains newer rows.
+    """
+    data_end     = anchor_date if anchor_date is not None else df["fiscalDateEnding"].max()
+    test_start   = data_end - pd.DateOffset(months=test_months)
+    train_cutoff = test_start - pd.Timedelta(days=gap_days)
+
+    train_df = df[df["fiscalDateEnding"] <= train_cutoff].copy()
+    test_df  = df[
+        (df["fiscalDateEnding"] >= test_start) &
+        (df["fiscalDateEnding"] <= data_end)
+    ].copy()
+
+    return train_df, test_df, train_cutoff, test_start, data_end
+
+def check_gpu() -> bool:
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            print(f"GPU detected: {result.stdout.strip()}")
+            return True
+    except Exception:
+        pass
+    print("No GPU detected — falling back to CPU")
+    return False
+
+DEVICE = "cuda" if check_gpu() else "cpu"
+
 def rank_target_cross_sectionally(y: pd.Series) -> pd.Series:
     """
     Rank target within each fiscal quarter (date bin).
@@ -128,16 +181,3 @@ def ic_scorer(estimator, X, y):
     ic, _ = spearmanr(y, preds)
     return ic if not np.isnan(ic) else 0.0
 
-def check_gpu() -> bool:
-    try:
-        result = subprocess.run(
-            ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader"],
-            capture_output=True, text=True, timeout=5,
-        )
-        if result.returncode == 0:
-            print(f"GPU detected: {result.stdout.strip()}")
-            return True
-    except Exception:
-        pass
-    print("No GPU detected — falling back to CPU")
-    return False

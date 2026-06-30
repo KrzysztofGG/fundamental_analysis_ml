@@ -12,8 +12,6 @@ Identical structure to training.py but uses a skorch NeuralNetRegressor
 
 Usage in notebook
 -----------------
-from training_MLP import training_pipeline_mlp, export_parquets_for_training
-
 df = export_parquets_for_training()
 scores, ensemble, best_feats = training_pipeline_mlp(df, STUDY_STORAGE, False, "mlp_v1")
 """
@@ -30,7 +28,8 @@ import torch
 import torch.nn as nn
 from scipy.stats import spearmanr, rankdata
 from skorch import NeuralNetRegressor
-from skorch.callbacks import EarlyStopping
+from skorch.callbacks import EarlyStopping, GradientNormClipping
+from skorch.dataset import ValidSplit
 from sklearn.feature_selection import mutual_info_regression
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LassoCV
@@ -43,21 +42,9 @@ optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 # ── Paths ──────────────────────────────────────────────────────────────────────
 RESULTS_DIR = Path("results_mlp")
-CACHE_DIR   = Path("cache")
 RESULTS_DIR.mkdir(exist_ok=True)
-CACHE_DIR.mkdir(exist_ok=True)
-
-# ── Config ────────────────────────────────────────────────────────────────────
-N_TRIALS_FULL = 100
-TOP_K         = 100
-RANDOM_STATE  = 42
-
-GAP_DAYS     = 456
-QUARTER_DAYS = 91
 
 BASE_METHODS = ["permutation", "mutual_info", "lasso"]
-
-DEVICE = "cuda" if check_gpu() else "cpu"
 
 def scale_features(
     X_train: pd.DataFrame, X_test: pd.DataFrame
@@ -80,7 +67,10 @@ class _MLPModule(nn.Module):
         layers: list[nn.Module] = []
         in_size = n_input
         for h in hidden_layer_sizes:
-            layers += [nn.Linear(in_size, h), nn.ReLU()]
+            layers += [
+                nn.Linear(in_size, h), 
+                nn.BatchNorm1d(h),
+                nn.LeakyReLU(negative_slope=0.01)]
             if dropout > 0:
                 layers.append(nn.Dropout(dropout))
             in_size = h
@@ -93,8 +83,22 @@ class _MLPModule(nn.Module):
 
 def _make_skorch_net(n_input: int, hidden_layer_sizes: tuple, dropout: float,
                      lr: float, weight_decay: float, batch_size: int,
-                     max_epochs: int) -> NeuralNetRegressor:
+                     max_epochs: int,
+                     use_early_stopping: bool = False,
+                     use_warm_start: bool = False,
+                     val_fraction: float = 0.15,
+                     ) -> NeuralNetRegressor:
     """Build a skorch NeuralNetRegressor with the given hyperparameters."""
+    
+    if use_early_stopping:
+        callbacks = [EarlyStopping(patience=15, monitor="valid_loss")]
+        train_split = ValidSplit(cv=val_fraction, stratified=False)
+    else:
+        callbacks = []
+        train_split=None
+
+    callbacks.append(GradientNormClipping(gradient_clip_value=1.0))
+
     return NeuralNetRegressor(
         module=_MLPModule,
         module__n_input=n_input,
@@ -106,10 +110,11 @@ def _make_skorch_net(n_input: int, hidden_layer_sizes: tuple, dropout: float,
         batch_size=batch_size,
         max_epochs=max_epochs,
         device=DEVICE,
-        callbacks=[EarlyStopping(patience=15, monitor="valid_loss")],
-        train_split=None,
+        callbacks=callbacks,
+        train_split=train_split,
         verbose=0,
         iterator_train__shuffle=True,
+        warm_start=use_warm_start,
     )
 
 
@@ -229,10 +234,6 @@ def load_or_run_feature_selection_mlp(
     print(f"Saved to {cache_file}")
     return methods
 
-
-
-
-
 def quick_cv_ic_gapped_mlp(
     feats: list[str],
     X_tr: pd.DataFrame,
@@ -241,6 +242,8 @@ def quick_cv_ic_gapped_mlp(
     gap_days: int = GAP_DAYS,
     train_years: int = 5,
     val_quarters: int = 4,
+    use_early_stopping: bool = False,
+    use_warm_start: bool = False,
 ) -> tuple[float, float, float]:
     """
     Walk-forward IC CV using a skorch NeuralNetRegressor.
@@ -309,9 +312,14 @@ def quick_cv_ic_gapped_mlp(
             weight_decay=net_params["weight_decay"],
             batch_size=net_params["batch_size"],
             max_epochs=net_params["max_epochs"],
+            use_early_stopping=use_early_stopping,
+            use_warm_start=use_warm_start,
         )
         net.fit(X_tr_sc, fold_y_tr)
         preds = net.predict(X_val_sc)
+        if np.std(preds) < 1e-6:
+            print(f"[WARN] Model collapsed to constant: {preds[0]}")
+            return -1.0, 0.0, 1.0
         ic, _ = spearmanr(fold_y_val, preds)
 
         if np.isnan(ic):
@@ -374,17 +382,18 @@ def make_objective_mlp(features: list[str], X_train: pd.DataFrame,
                         y_train: pd.Series, gap_days: int = GAP_DAYS):
     def objective(trial):
         net_params = dict(
-            n_layers     = trial.suggest_int("n_layers", 1, 4),
-            layer_size   = trial.suggest_int("layer_size", 32, 512, log=True),
-            dropout      = trial.suggest_float("dropout", 0.0, 0.5),
-            lr           = trial.suggest_float("lr", 1e-4, 1e-1, log=True),
-            weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-1, log=True),
-            batch_size   = trial.suggest_categorical("batch_size", [64, 128, 256, 512]),
-            max_epochs   = trial.suggest_int("max_epochs", 50, 300),
+            n_layers     = trial.suggest_int("n_layers", 1, 3),
+            layer_size   = trial.suggest_int("layer_size", 32, 256, log=True),
+            dropout      = trial.suggest_float("dropout", 0.05, 0.4),
+            lr           = trial.suggest_float("lr", 1e-4, 1e-2, log=True),
+            weight_decay = trial.suggest_float("weight_decay", 1e-6, 1e-3, log=True),
+            batch_size   = trial.suggest_categorical("batch_size", [128, 256, 512]),
+            max_epochs   = trial.suggest_int("max_epochs", 50, 250),
         )
 
         mean_ic, std_ic, mean_rmse = quick_cv_ic_gapped_mlp(
             features, X_train, y_train, net_params=net_params, gap_days=gap_days,
+            use_early_stopping=True, use_warm_start=False,
         )
         icir = mean_ic / std_ic if std_ic > 0 else 0.0
         trial.set_user_attr("val_ic",     mean_ic)
@@ -393,7 +402,7 @@ def make_objective_mlp(features: list[str], X_train: pd.DataFrame,
         trial.set_user_attr("val_rmse",   mean_rmse)
         trial.set_user_attr("n_layers",   net_params["n_layers"])
         trial.set_user_attr("layer_size", net_params["layer_size"])
-        return -mean_ic
+        return -mean_ic if not np.isnan(mean_ic) else 1.0
 
     return objective
 
@@ -413,6 +422,7 @@ def save_final_models(
     best_feats: list[str],
     scores: dict,
     best_params: dict,
+    data_end: pd.Timestamp,
     experiment_name: str = "",
     ensemble: MLPEnsembleModel | None = None,
     ensemble_methods: list[str] | None = None,
@@ -446,6 +456,7 @@ def save_final_models(
         "best_feats":       best_feats,
         "best_params":      {k: _clean(v) for k, v in best_params.items()},
         "scores":           {k: _clean(v) for k, v in scores.items()},
+        "data_end": data_end.strftime("%Y-%m-%d"),
     }
 
     with open(meta_path, "w") as f:
@@ -498,21 +509,23 @@ def training_pipeline_mlp(
 
     TEST_MONTHS = 24
     GAP         = pd.Timedelta(days=GAP_DAYS)
-    data_end    = df["fiscalDateEnding"].max()
+    # data_end    = df["fiscalDateEnding"].max()
 
-    test_end     = data_end
-    test_start   = data_end - pd.DateOffset(months=TEST_MONTHS)
-    train_cutoff = test_start - GAP
+    # test_end     = data_end
+    # test_start   = data_end - pd.DateOffset(months=TEST_MONTHS)
+    # train_cutoff = test_start - GAP
 
+
+    # train_df = df[df["fiscalDateEnding"] <= train_cutoff].copy()
+    # test_df  = df[(df["fiscalDateEnding"] >= test_start) &
+    #               (df["fiscalDateEnding"] <= test_end)].copy()
+
+    train_df, test_df, train_cutoff, test_start, test_end = derive_train_test_split(df, test_months=TEST_MONTHS, gap_days=GAP_DAYS)
     print(f"Train pool : up to  {train_cutoff.strftime('%Y-%m-%d')}")
     print(f"Gap        : {GAP.days}d  →  {test_start.strftime('%Y-%m-%d')}")
     print(f"Test       : {test_start.strftime('%Y-%m-%d')}  →  {test_end.strftime('%Y-%m-%d')}")
     print(f"Train rows : {(df['fiscalDateEnding'] <= train_cutoff).sum()}")
     print(f"Test rows  : {((df['fiscalDateEnding'] >= test_start) & (df['fiscalDateEnding'] <= test_end)).sum()}")
-
-    train_df = df[df["fiscalDateEnding"] <= train_cutoff].copy()
-    test_df  = df[(df["fiscalDateEnding"] >= test_start) &
-                  (df["fiscalDateEnding"] <= test_end)].copy()
 
     X_train_raw, y_reg_train_raw = split_target_with_date_index(train_df)
     X_test_raw,  y_reg_test_raw  = split_target_with_date_index(test_df)
@@ -532,18 +545,18 @@ def training_pipeline_mlp(
         force_feature_selection, experiment_name,
     )
 
-    proxy_net_params = dict(n_layers=1, layer_size=64, dropout=0.0,
-                            lr=1e-3, weight_decay=1e-4,
-                            batch_size=256, max_epochs=30)
-    print(f"\n  {'method':<12}  {'n_feats':>7}  {'mean_IC':>8}  {'std_IC':>7}  {'ICIR':>6}  {'RMSE':>7}")
-    print(f"  {'-'*12}  {'-'*7}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}")
-    for name, feats in methods.items():
-        mean_ic, std_ic, mean_rmse = quick_cv_ic_gapped_mlp(
-            feats, X_train, y_reg_train, net_params=proxy_net_params,
-        )
-        icir = mean_ic / std_ic if std_ic > 0 else 0.0
-        print(f"  {name:<12}  {len(feats):>7}  {mean_ic:>8.4f}  "
-              f"{std_ic:>7.4f}  {icir:>6.3f}  {mean_rmse:>7.4f}")
+    # proxy_net_params = dict(n_layers=1, layer_size=64, dropout=0.0,
+    #                         lr=1e-3, weight_decay=1e-4,
+    #                         batch_size=256, max_epochs=30)
+    # print(f"\n  {'method':<12}  {'n_feats':>7}  {'mean_IC':>8}  {'std_IC':>7}  {'ICIR':>6}  {'RMSE':>7}")
+    # print(f"  {'-'*12}  {'-'*7}  {'-'*8}  {'-'*7}  {'-'*6}  {'-'*7}")
+    # for name, feats in methods.items():
+    #     mean_ic, std_ic, mean_rmse = quick_cv_ic_gapped_mlp(
+    #         feats, X_train, y_reg_train, net_params=proxy_net_params,
+    #     )
+    #     icir = mean_ic / std_ic if std_ic > 0 else 0.0
+    #     print(f"  {name:<12}  {len(feats):>7}  {mean_ic:>8.4f}  "
+    #           f"{std_ic:>7.4f}  {icir:>6.3f}  {mean_rmse:>7.4f}")
 
     # ── Optuna pass — one study per method ───────────────────────────────────
     print("\n─── Optuna pass (all methods) ────────────────────────────")
@@ -658,6 +671,7 @@ def training_pipeline_mlp(
         best_feats=best_feats,
         scores=scores,
         best_params=best_params,
+        data_end=test_end,
         experiment_name=experiment_name,
         ensemble=ensemble,
         ensemble_methods=BASE_METHODS,
